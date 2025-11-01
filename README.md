@@ -5,6 +5,12 @@ A browser-based application for conducting **two-burst fusion/separation (gap de
 
 ---
 
+## 🌐 Live Demo
+
+**Try the app here:** [https://dreamycat925-click-fusion-tes-click-fusion-streamlit-app-wt24xd.streamlit.app/](https://dreamycat925-click-fusion-tes-click-fusion-streamlit-app-wt24xd.streamlit.app/)
+
+---
+
 ## Features
 
 - 1 kHz tone bursts (7 ms Hann window recommended) providing comfortable, non-piercing stimuli
