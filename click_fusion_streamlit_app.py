@@ -1,31 +1,48 @@
-# click_fusion_streamlit_app.py  （Startボタン不要版＋7ms固定推奨の表示）
+# click_fusion_streamlit_app.py
+# Streamlit + Web Audio: Two-burst fusion test
+# - Tone (recommended) or Click (noise burst) selectable
+# - No "Start" button; AudioContext is created/reused on first play
+# - 1 kHz tone burst (Hann) by default; 7 ms fixed推奨
 import json
 from textwrap import dedent
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 
-st.set_page_config(page_title="1 kHz Click Fusion (Two-Burst)", page_icon="🎧", layout="centered")
-st.title("🎧 1 kHz Click Fusion (Two-Burst) — Streamlit")
+st.set_page_config(page_title="Two-Burst Fusion (Tone/Click)", page_icon="🎧", layout="centered")
+st.title("🎧 Two-Burst Fusion (Tone / Click) — Streamlit")
 
 st.markdown("""
 **使い方（必読）**
 - 有線・密閉型ヘッドホン必須（Bluetooth/スピーカー不可）
-- **臨床運用ではトーン長は 7 ms 固定を推奨**（スライダーは原則そのまま）
-- レベル（音量）は**各耳で固定**（SRT + 40–50 dB SL または MCL）
+- **臨床運用ではトーン長は 7 ms 固定を推奨**（下のスライダーは原則そのまま）
+- レベル（音量）は**各耳で固定**（SRT + 40–50 dB SL or MCL）
 """)
 
-# ---- Streamlit 側 UI ----
+# ---- Streamlit UI ----
+stim_mode = st.radio("刺激タイプ", ["Tone（推奨）", "Click（ノイズ・バースト）"], index=0, horizontal=True)
 ear  = st.radio("Ear（片耳/両耳）", ["R", "L", "Both"], horizontal=True, index=0)
 gap  = st.slider("Gap (ms)", 1.0, 20.0, 10.0, 0.5)
-dur  = st.slider("Tone-burst 長さ (ms, Hann) — ※臨床は 7 ms 固定推奨", 3.0, 12.0, 7.0, 0.5)
+
+colA, colB = st.columns(2)
+with colA:
+    dur  = st.slider("Tone-burst 長さ (ms, Hann) — ※臨床は 7 ms 固定推奨", 3.0, 12.0, 7.0, 0.5)
+with colB:
+    click_ms = st.slider("Click 長さ (ms, Hann)", 0.1, 2.0, 0.6, 0.05)
 rove = st.checkbox("±3 dB ロービング（研究用。通常はOFF）", value=False)
 
-cfg = {"gap": gap, "dur": dur, "ear": ear, "rove": rove}
+cfg = {
+    "stim": "tone" if stim_mode.startswith("Tone") else "click",
+    "gap": gap, "dur": dur, "click_ms": click_ms,
+    "ear": ear, "rove": rove,
+    "freq_hz": 1000,          # 1 kHz固定
+    "target_rms": 0.03,       # 再生側でRMS合わせ
+    "sr": 48000               # 48 kHz
+}
 
 st.divider()
 
-# ---- HTML/JS（f-stringを使わず、安全にJSON埋め込み）----
+# ---- HTML/JS with JSON injection (avoid f-string braces conflicts) ----
 html = dedent(r"""
 <!doctype html>
 <meta charset="utf-8">
@@ -42,42 +59,36 @@ html = dedent(r"""
 
 <div>
   <span class="pill" id="pill"></span>
-  <div class="note">有線ヘッドホン／EQ・空間オーディオOFF。音量は各耳で固定。</div>
+  <div class="note">
+    有線ヘッドホン／EQ・空間オーディオOFF。音量は各耳で固定。<br>
+    臨床は <b>トーン 7 ms 固定を推奨</b>（クリックは切替可能）。
+  </div>
 
   <fieldset>
     <legend>再生</legend>
     <div class="row">
-      <button id="play1">▶ 1バースト（同長ダミー）</button>
-      <button id="play2" class="primary">▶ 2バースト</button>
+      <button id="play1">▶ 1発（同長ダミー）</button>
+      <button id="play2" class="primary">▶ 2発</button>
       <button id="playRand">🎲 ランダム (1 or 2)</button>
     </div>
   </fieldset>
 </div>
 
-<!-- Pythonから設定をJSONで埋め込み -->
 <script id="cfg" type="application/json">{CFG_JSON}</script>
-
 <script>
-let sr = 48000;
-const FREQ = 1000;
-const TARGET_RMS = 0.03;
-
-// AudioContext をグローバル再利用（Streamlitの再描画でも保持）
+let ctx_global = null;
 function getCtx(){
-  if (window._audCtx) return window._audCtx;
+  if (ctx_global) return ctx_global;
   try {
-    window._audCtx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+    ctx_global = new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
   } catch(e) {
-    window._audCtx = new (window.AudioContext||window.webkitAudioContext)();
+    ctx_global = new (window.AudioContext||window.webkitAudioContext)();
   }
-  return window._audCtx;
+  return ctx_global;
 }
-
 function ensureCtx(){
   const ctx = getCtx();
-  // Safari 対策：ボタン押下の度に resume（ユーザー操作イベント内でOK）
-  if (ctx.state === "suspended") { ctx.resume(); }
-  sr = ctx.sampleRate || 48000;
+  if (ctx.state === "suspended") ctx.resume();
   return ctx;
 }
 
@@ -85,17 +96,25 @@ function rms(a){ let s=0; for(let i=0;i<a.length;i++) s+=a[i]*a[i]; return Math.
 function db2lin(db){ return Math.pow(10, db/20); }
 
 const CFG = JSON.parse(document.getElementById('cfg').textContent);
-let GAP_MS   = CFG.gap;
-let BURST_MS = CFG.dur;
-let EAR      = CFG.ear;
-let ROVING   = CFG.rove;
+let MODE   = CFG.stim;       // "tone" | "click"
+let GAP_MS = CFG.gap;
+let TB_MS  = CFG.dur;        // tone burst ms
+let CK_MS  = CFG.click_ms;   // click (noise burst) ms
+let EAR    = CFG.ear;        // "L","R","Both"
+let ROVING = CFG.rove;
+let SR     = CFG.sr || 48000;
+const FREQ = CFG.freq_hz || 1000;
+const TARGET_RMS = CFG.target_rms || 0.03;
 
+// badge
 document.addEventListener('DOMContentLoaded', ()=>{
   const pill = document.getElementById('pill');
-  pill.textContent = `SR=48 kHz / 1 kHz / Hann ${BURST_MS.toFixed(1)} ms / Gap ${GAP_MS.toFixed(1)} ms / Ear ${EAR}`;
+  const modeTxt = (MODE==="tone") ? `Tone ${FREQ} Hz / Hann ${TB_MS.toFixed(1)} ms`
+                                  : `Click (noise) / Hann ${CK_MS.toFixed(2)} ms`;
+  pill.textContent = `SR=${SR/1000|0*1}48 kHz / ${modeTxt} / Gap ${GAP_MS.toFixed(1)} ms / Ear ${EAR}`;
 });
 
-function makeToneBurst(freq=FREQ, ms=BURST_MS){
+function makeToneBurst(freq=FREQ, ms=TB_MS, sr=SR){
   const n = Math.max(8, Math.round(sr*ms/1000));
   const w = new Float32Array(n);
   for(let i=0;i<n;i++){
@@ -108,70 +127,73 @@ function makeToneBurst(freq=FREQ, ms=BURST_MS){
   return w;
 }
 
-function toBuffer(L, R){
+function makeClickBurst(ms=CK_MS, sr=SR){
+  const n = Math.max(8, Math.round(sr*ms/1000));
+  const w = new Float32Array(n);
+  // white noise + Hann window
+  for(let i=0;i<n;i++) w[i] = (Math.random()*2-1);
+  let pk = 0; for(let i=0;i<n;i++) pk = Math.max(pk, Math.abs(w[i]));
+  if(pk>1e-9){ for(let i=0;i<n;i++) w[i] /= pk; }
+  for(let i=0;i<n;i++){ const han = 0.5 - 0.5*Math.cos(2*Math.PI*i/(n-1)); w[i]*=han; }
+  return w;
+}
+
+function synthTwoBurst(sr=SR){
   const ctx = ensureCtx();
-  const buf = ctx.createBuffer(2, L.length, sr);
-  buf.copyToChannel(L, 0); buf.copyToChannel(R, 1);
-  return {ctx, buf};
-}
-
-function assembleTwoBurst(){
-  const tb = makeToneBurst();
   const gapN = Math.round(sr*GAP_MS/1000);
-  const total = tb.length + gapN + tb.length;
+  const unit = (MODE==="tone") ? makeToneBurst(undefined, TB_MS, sr)
+                               : makeClickBurst(CK_MS, sr);
+  const total = unit.length + gapN + unit.length;
   let L = new Float32Array(total), R = new Float32Array(total);
-
   const add=(dst,src,off)=>{ for(let i=0;i<src.length && off+i<dst.length;i++) dst[off+i]+=src[i]; };
-  if(EAR==='L'||EAR==='Both'){ add(L,tb,0); add(L,tb,tb.length+gapN); }
-  if(EAR==='R'||EAR==='Both'){ add(R,tb,0); add(R,tb,tb.length+gapN); }
-
+  if(EAR==='L'||EAR==='Both'){ add(L,unit,0); add(L,unit,unit.length+gapN); }
+  if(EAR==='R'||EAR==='Both'){ add(R,unit,0); add(R,unit,unit.length+gapN); }
   let refCh = (EAR==='L')? L : (EAR==='R')? R : L;
   const ref = rms(refCh);
   const k = (ref>1e-9)? (TARGET_RMS/ref) : 1.0;
   for(let i=0;i<L.length;i++){ L[i]*=k; R[i]*=k; }
   if(ROVING){ const kk=db2lin((Math.random()*6)-3); for(let i=0;i<L.length;i++){ L[i]*=kk; R[i]*=kk; } }
-
-  const {ctx, buf} = toBuffer(L,R);
+  const buf = ctx.createBuffer(2, total, sr);
+  buf.copyToChannel(L,0); buf.copyToChannel(R,1);
   return {ctx, buf};
 }
 
-function assembleOneLike(){
-  const tb = makeToneBurst();
+function synthOneLike(sr=SR){
+  const ctx = ensureCtx();
   const gapN = Math.round(sr*GAP_MS/1000);
-  const total = tb.length + gapN + tb.length;
+  const unit = (MODE==="tone") ? makeToneBurst(undefined, TB_MS, sr)
+                               : makeClickBurst(CK_MS, sr);
+  const total = unit.length + gapN + unit.length;
   let L = new Float32Array(total), R = new Float32Array(total);
-
   const add=(dst,src,off)=>{ for(let i=0;i<src.length && off+i<dst.length;i++) dst[off+i]+=src[i]; };
-  if(EAR==='L'||EAR==='Both') add(L,tb,0);
-  if(EAR==='R'||EAR==='Both') add(R,tb,0);
-
+  if(EAR==='L'||EAR==='Both') add(L,unit,0);
+  if(EAR==='R'||EAR==='Both') add(R,unit,0);
   let refCh = (EAR==='L')? L : (EAR==='R')? R : L;
   const ref = rms(refCh);
   const k = (ref>1e-9)? (TARGET_RMS/ref) : 1.0;
   for(let i=0;i<L.length;i++){ L[i]*=k; R[i]*=k; }
   if(ROVING){ const kk=db2lin((Math.random()*6)-3); for(let i=0;i<L.length;i++){ L[i]*=kk; R[i]*=kk; } }
-
-  const {ctx, buf} = toBuffer(L,R);
+  const buf = ctx.createBuffer(2, total, sr);
+  buf.copyToChannel(L,0); buf.copyToChannel(R,1);
   return {ctx, buf};
 }
 
-function playBuffer(getter){
+function play(getter){
   const {ctx, buf} = getter();
   const node = ctx.createBufferSource();
   node.buffer = buf; node.connect(ctx.destination); node.start();
 }
 
-// ボタン：ユーザーのクリックがあるのでオートプレイ制限に掛からない
-document.getElementById('play1').onclick = ()=> playBuffer(assembleOneLike);
-document.getElementById('play2').onclick = ()=> playBuffer(assembleTwoBurst);
+document.getElementById('play1').onclick = ()=> play(synthOneLike);
+document.getElementById('play2').onclick = ()=> play(synthTwoBurst);
 document.getElementById('playRand').onclick = ()=> {
-  (Math.random() < 0.5 ? playBuffer(assembleTwoBurst) : playBuffer(assembleOneLike));
+  (Math.random() < 0.5 ? play(synthTwoBurst) : play(synthOneLike));
 };
 </script>
 """)
 
 html = html.replace("{CFG_JSON}", json.dumps(cfg))
-st.components.v1.html(html, height=240, scrolling=False)
+st.components.v1.html(html, height=280, scrolling=False)
 
 # ---- 簡易ログ ----
 st.subheader("応答ログ")
@@ -190,7 +212,8 @@ with col4:
 if add and heard != "未選択":
     st.session_state.log.append(dict(
         time=datetime.now().isoformat(timespec="seconds"),
-        ear=ear, gap_ms=gap, burst_ms=dur, roving=rove,
+        stim=stim_mode.split("（")[0],
+        ear=ear, gap_ms=gap, burst_ms=dur, click_ms=click_ms, roving=rove,
         response=heard, trial=int(ntr),
     ))
     st.success("追加しました。")
@@ -203,4 +226,4 @@ if st.session_state.log:
     df = pd.DataFrame(st.session_state.log)
     st.dataframe(df, use_container_width=True)
     st.download_button("CSVダウンロード", df.to_csv(index=False).encode("utf-8"),
-                       file_name="click_fusion_1k_log.csv", mime="text/csv")
+                       file_name="fusion_test_log.csv", mime="text/csv")
