@@ -1,11 +1,4 @@
 # click_fusion_streamlit_app.py
-# Streamlit + Web Audio: Two-burst fusion test
-# - Tone（推奨 / 1 kHz / Hann）と Click（ノイズ・バースト）を切替可
-# - iPhone/ヘッドホン挿抜でも鳴るように Web Audio を堅牢化
-#   * AudioContext: sampleRate固定を撤廃（ハードに委譲）
-#   * 再生直前に await resume()
-#   * devicechange で close→再生成（route切替時の無音対策）
-
 import json
 from textwrap import dedent
 import streamlit as st
@@ -23,7 +16,7 @@ st.markdown("""
 - iPhoneは **EQ/空間/ヘッドフォン調整/サウンドチェック=OFF**、**モノラル=OFF**、L/Rバランス中央
 """)
 
-# ---------------- Streamlit UI ----------------
+# ----------- UI -----------
 stim_mode = st.radio("刺激タイプ", ["Tone（推奨）", "Click（ノイズ・バースト）"], index=0, horizontal=True)
 ear  = st.radio("Ear（片耳/両耳）", ["R", "L", "Both"], index=0, horizontal=True)
 gap  = st.slider("Gap (ms)", 1.0, 20.0, 10.0, 0.5)
@@ -39,14 +32,13 @@ cfg = {
     "stim": "tone" if stim_mode.startswith("Tone") else "click",
     "gap": gap, "dur": dur, "click_ms": click_ms,
     "ear": ear, "rove": rove,
-    "freq_hz": 1000,        # 1 kHz 固定
-    "target_rms": 0.03,     # 再生側でRMS調整
-    # sampleRateはJS側で自動交渉（固定しない）
+    "freq_hz": 1000,
+    "target_rms": 0.03,
 }
 
 st.divider()
 
-# ---------------- HTML/JS Embedding ----------------
+# ----------- HTML/JS -----------
 html = dedent(r"""
 <!doctype html>
 <meta charset="utf-8">
@@ -59,6 +51,7 @@ html = dedent(r"""
   button.primary{background:#0ea5e9;color:#fff;border-color:#0ea5e9}
   .note{color:#555;font-size:0.9rem}
   .pill{padding:2px 10px;border-radius:999px;background:#f3f4f6}
+  #unlock{display:none;margin:4px 0;padding:8px 12px;border-radius:10px;border:1px solid #ddd}
 </style>
 
 <div>
@@ -67,6 +60,9 @@ html = dedent(r"""
     有線ヘッドホン／EQ・空間オーディオ・ヘッドフォン調整はOFF。音量は各耳で固定。<br>
     臨床は <b>Tone 1 kHz / Hann 7 ms 固定推奨</b>（Clickは切替で使用可）。
   </div>
+  <!-- ★ iOS専用：初回だけ表示される解錠ボタン -->
+  <button id="unlock">🔊 オーディオを有効にする（iPhoneは最初に1回タップ）</button>
+
   <fieldset>
     <legend>再生</legend>
     <div class="row">
@@ -78,65 +74,67 @@ html = dedent(r"""
 </div>
 
 <script id="cfg" type="application/json">{CFG_JSON}</script>
-
 <script>
-// ====== Web Audio: robust handling for iOS + route changes ======
+// ===== iOS検出 & 解錠ボタン =====
+function isIOS(){
+  return /iP(hone|od|ad)/.test(navigator.platform) ||
+         (navigator.userAgent.includes("Mac") && "ontouchend" in document);
+}
 let ctx_global = null;
 
-// AudioContextを作成（sampleRateは固定指定しない）
 async function createCtx(){
-  try {
-    return new (window.AudioContext||window.webkitAudioContext)();
-  } catch(e) {
-    return new (window.AudioContext||window.webkitAudioContext)();
-  }
+  // sampleRateは固定指定しない（経路切替に追随しやすい）
+  try { return new (window.AudioContext||window.webkitAudioContext)(); }
+  catch(e){ return new (window.AudioContext||window.webkitAudioContext)(); }
 }
-
-// 必ず resume() を await して有効化
 async function ensureCtx(){
   if (!ctx_global) ctx_global = await createCtx();
-  if (ctx_global.state === "suspended") {
-    try { await ctx_global.resume(); } catch(e) {}
-  }
+  if (ctx_global.state === "suspended") { try { await ctx_global.resume(); } catch(e){} }
   return ctx_global;
 }
+async function unlockAudio(){
+  ctx_global = await createCtx();
+  try { await ctx_global.resume(); } catch(e) {}
+  // 1ms無音（ユーザー操作中の“解錠”）
+  const sr = ctx_global.sampleRate || 48000;
+  const buf = ctx_global.createBuffer(2, Math.max(1, Math.floor(sr*0.001)), sr);
+  const node = ctx_global.createBufferSource(); node.buffer = buf;
+  node.connect(ctx_global.destination); node.start();
+}
+document.addEventListener('DOMContentLoaded', ()=>{
+  const pill = document.getElementById('pill');
+  const cfg = JSON.parse(document.getElementById('cfg').textContent);
+  const modeTxt = (cfg.stim==="tone") ? `Tone ${cfg.freq_hz} Hz / Hann ${cfg.dur.toFixed?.(1)||cfg.dur} ms`
+                                      : `Click (noise) / Hann ${cfg.click_ms.toFixed?.(2)||cfg.click_ms} ms`;
+  pill.textContent = `${modeTxt} / Gap ${cfg.gap.toFixed?.(1)||cfg.gap} ms / Ear ${cfg.ear}`;
 
-// ヘッドホン抜き差しなどのデバイス切替で無音化しないように再生成
+  const btn = document.getElementById('unlock');
+  if (isIOS()) {
+    btn.style.display = 'inline-block';
+    btn.addEventListener('click', async ()=>{ await unlockAudio(); btn.style.display='none'; }, {once:true});
+    // 念のためタッチ開始でも解錠（ボタンが押されなくても最初のタップで解錠）
+    window.addEventListener('touchstart', async ()=>{
+      if (!ctx_global || ctx_global.state!=="running") { await unlockAudio(); btn.style.display='none'; }
+    }, {once:true});
+  }
+});
+
+// ヘッドホン抜き差し（route変更）に強くする
 if (navigator.mediaDevices?.addEventListener) {
   navigator.mediaDevices.addEventListener("devicechange", async () => {
     try {
       if (ctx_global) { try { await ctx_global.close(); } catch(e){} }
       ctx_global = await createCtx();
-      // 1msの無音を鳴らしてroute確立（ユーザー操作直後に走るのが理想だが保険として）
-      const sr = ctx_global.sampleRate || 48000;
-      const buf = ctx_global.createBuffer(2, Math.max(1, Math.floor(sr*0.001)), sr);
-      const node = ctx_global.createBufferSource(); node.buffer = buf;
-      node.connect(ctx_global.destination); node.start();
     } catch(e) {}
   });
 }
 
-// ====== Stimulus Synthesis ======
+// ===== 刺激合成 =====
 function rms(a){ let s=0; for(let i=0;i<a.length;i++) s+=a[i]*a[i]; return Math.sqrt(s/a.length); }
 function db2lin(db){ return Math.pow(10, db/20); }
-
 const CFG = JSON.parse(document.getElementById('cfg').textContent);
-let MODE   = CFG.stim;       // "tone" | "click"
-let GAP_MS = CFG.gap;
-let TB_MS  = CFG.dur;        // tone burst ms
-let CK_MS  = CFG.click_ms;   // click burst ms
-let EAR    = CFG.ear;        // "L" | "R" | "Both"
-let ROVING = CFG.rove;
-const FREQ = CFG.freq_hz || 1000;
-const TARGET_RMS = CFG.target_rms || 0.03;
-
-// バッジ表示
-document.addEventListener('DOMContentLoaded', ()=>{
-  const pill = document.getElementById('pill');
-  const modeTxt = (MODE==="tone") ? `Tone ${FREQ} Hz / Hann ${TB_MS.toFixed(1)} ms`
-                                  : `Click (noise) / Hann ${CK_MS.toFixed(2)} ms`;
-  pill.textContent = `${modeTxt} / Gap ${GAP_MS.toFixed(1)} ms / Ear ${EAR}`;
-});
+let MODE   = CFG.stim, GAP_MS = CFG.gap, TB_MS = CFG.dur, CK_MS = CFG.click_ms, EAR = CFG.ear, ROVING = CFG.rove;
+const FREQ = CFG.freq_hz || 1000, TARGET_RMS = CFG.target_rms || 0.03;
 
 function makeToneBurst(freq=FREQ, ms=TB_MS, sr){
   const n = Math.max(8, Math.round(sr*ms/1000));
@@ -150,23 +148,18 @@ function makeToneBurst(freq=FREQ, ms=TB_MS, sr){
   if(pk>1e-9){ for(let i=0;i<n;i++) w[i] /= pk; }
   return w;
 }
-
 function makeClickBurst(ms=CK_MS, sr){
   const n = Math.max(8, Math.round(sr*ms/1000));
   const w = new Float32Array(n);
   for(let i=0;i<n;i++) w[i] = (Math.random()*2-1);
-  // peak normalize
   let pk = 0; for(let i=0;i<n;i++) pk = Math.max(pk, Math.abs(w[i]));
   if(pk>1e-9){ for(let i=0;i<n;i++) w[i] /= pk; }
-  // Hann window
   for(let i=0;i<n;i++){ const han = 0.5 - 0.5*Math.cos(2*Math.PI*i/(n-1)); w[i]*=han; }
   return w;
 }
-
 function synthTwoBurst(sr){
   const gapN = Math.round(sr*GAP_MS/1000);
-  const unit = (MODE==="tone") ? makeToneBurst(FREQ, TB_MS, sr)
-                               : makeClickBurst(CK_MS, sr);
+  const unit = (MODE==="tone") ? makeToneBurst(FREQ, TB_MS, sr) : makeClickBurst(CK_MS, sr);
   const total = unit.length + gapN + unit.length;
   let L = new Float32Array(total), R = new Float32Array(total);
   const add=(dst,src,off)=>{ for(let i=0;i<src.length && off+i<dst.length;i++) dst[off+i]+=src[i]; };
@@ -176,13 +169,11 @@ function synthTwoBurst(sr){
   const k = (ref>1e-9)? (TARGET_RMS/ref) : 1.0;
   for(let i=0;i<L.length;i++){ L[i]*=k; R[i]*=k; }
   if(ROVING){ const kk=db2lin((Math.random()*6)-3); for(let i=0;i<L.length;i++){ L[i]*=kk; R[i]*=kk; } }
-  return {L, R, total};
+  return {L,R,total};
 }
-
 function synthOneLike(sr){
   const gapN = Math.round(sr*GAP_MS/1000);
-  const unit = (MODE==="tone") ? makeToneBurst(FREQ, TB_MS, sr)
-                               : makeClickBurst(CK_MS, sr);
+  const unit = (MODE==="tone") ? makeToneBurst(FREQ, TB_MS, sr) : makeClickBurst(CK_MS, sr);
   const total = unit.length + gapN + unit.length;
   let L = new Float32Array(total), R = new Float32Array(total);
   const add=(dst,src,off)=>{ for(let i=0;i<src.length && off+i<dst.length;i++) dst[off+i]+=src[i]; };
@@ -192,14 +183,14 @@ function synthOneLike(sr){
   const k = (ref>1e-9)? (TARGET_RMS/ref) : 1.0;
   for(let i=0;i<L.length;i++){ L[i]*=k; R[i]*=k; }
   if(ROVING){ const kk=db2lin((Math.random()*6)-3); for(let i=0;i<L.length;i++){ L[i]*=kk; R[i]*=kk; } }
-  return {L, R, total};
+  return {L,R,total};
 }
 
-// 再生：毎回 ensureCtx() を await し、route切替後のsuspendedに強くする
+// 再生：毎回 resume を await（iOSで確実に）
 async function play(getter){
   const ctx = await ensureCtx();
   const sr  = ctx.sampleRate || 48000;
-  const {L, R, total} = getter(sr);
+  const {L,R,total} = getter(sr);
   const buf = ctx.createBuffer(2, total, sr);
   buf.copyToChannel(L,0); buf.copyToChannel(R,1);
   try { if (ctx.state === "suspended") await ctx.resume(); } catch(e) {}
@@ -207,9 +198,9 @@ async function play(getter){
   node.buffer = buf; node.connect(ctx.destination); node.start();
 }
 
-// ボタン（async/await で確実にresume→startの順）
-document.getElementById('play1').onclick = async ()=>{ await play(synthOneLike);  };
-document.getElementById('play2').onclick = async ()=>{ await play(synthTwoBurst); };
+// ボタン（async）
+document.getElementById('play1').onclick  = async ()=>{ await play(synthOneLike);  };
+document.getElementById('play2').onclick  = async ()=>{ await play(synthTwoBurst); };
 document.getElementById('playRand').onclick = async ()=>{
   if (Math.random() < 0.5) { await play(synthTwoBurst); } else { await play(synthOneLike); }
 };
@@ -217,9 +208,9 @@ document.getElementById('playRand').onclick = async ()=>{
 """)
 
 html = html.replace("{CFG_JSON}", json.dumps(cfg))
-st.components.v1.html(html, height=320, scrolling=False)
+st.components.v1.html(html, height=360, scrolling=False)
 
-# ---------------- Response Logger ----------------
+# ----------- ロガー -----------
 st.subheader("応答ログ")
 if "log" not in st.session_state:
     st.session_state.log = []
